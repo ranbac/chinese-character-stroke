@@ -1,0 +1,94 @@
+/**
+ * Tải thư viện Hanzi Writer JS thông qua hook của WordPress.
+ */
+function my_enqueue_hanzi_writer_script() {
+    wp_enqueue_script(
+        'hanzi-writer', // Tên script
+        'https://cdn.jsdelivr.net/npm/hanzi-writer@3.5/dist/hanzi-writer.min.js', // Nguồn
+        array(), // Không có script phụ thuộc
+        '3.5',   // Phiên bản
+        true     // Tải ở cuối trang (footer)
+    );
+}
+
+add_action('wp_enqueue_scripts', 'my_enqueue_hanzi_writer_script');
+/**
+ * Tự động chèn Hanzi Writer cho mục từ Glossary.
+ * PHIÊN BẢN CUỐI CÙNG: Hỗ trợ bất kỳ số lượng ký tự Hán nào trong tiêu đề.
+ */
+function auto_insert_stroke_order_into_glossary_final($content) {
+    // Chỉ thực thi trên trang chi tiết của mục từ 'glossary'.
+    if ( is_singular('glossary') ) {
+        $title = get_the_title();
+
+        // KIỂM TRA XEM TOÀN BỘ TIÊU ĐỀ CÓ PHẢI LÀ CHỮ HÁN KHÔNG (từ 1 ký tự trở lên)
+        // Dấu "+" trong regex có nghĩa là "một hoặc nhiều lần".
+        if ( preg_match('/^[\x{4e00}-\x{9fa5}]+$/u', $title) ) {
+            
+            // Tách tất cả ký tự trong tiêu đề ra thành một mảng.
+            $characters = mb_str_split($title, 1, 'UTF-8');
+            $all_hanzi_html = '';
+            $all_hanzi_script = '';
+
+            // Vòng lặp qua TẤT CẢ các ký tự để tạo HTML và Script.
+            foreach ($characters as $index => $char) {
+                // Tạo ID và tên biến JS duy nhất cho mỗi ký tự.
+                $char_id = 'hanzi-auto-container-' . get_the_ID() . '-' . $index;
+                $writer_var = 'hanzi_writer_' . get_the_ID() . '_' . $index;
+
+                // Tạo khối HTML cho mỗi ký tự. Tôi đã giảm kích thước một chút để hiển thị đẹp hơn khi có nhiều chữ.
+                $all_hanzi_html .= '
+                    <div class="hanzi-char-wrapper" style="flex-shrink: 0;">
+                        <div id="' . esc_attr($char_id) . '" style="width:200px; height:200px; border: 1px solid #eee; border-radius: 4px;"></div>
+                        <div style="text-align: center; margin-top: 8px; display:flex; justify-content:center; gap:8px;">
+                             <button style="font-size: 12px; padding: 4px 8px; cursor:pointer;" onclick="window.' . $writer_var . '.animateCharacter();">Xem lại</button>
+                             <button style="font-size: 12px; padding: 4px 8px; cursor:pointer;" onclick="window.' . $writer_var . '.quiz();">Luyện viết</button>
+                        </div>
+                    </div>
+                ';
+
+                // Tạo dòng script khởi tạo cho mỗi ký tự.
+                $all_hanzi_script .= '
+                    window.' . $writer_var . ' = HanziWriter.create("' . esc_attr($char_id) . '", "' . esc_js($char) . '", {
+                        width: 200,
+                        height: 200,
+                        padding: 5,
+                        showOutline: true,
+                        strokeAnimationSpeed: 1,
+                        delayBetweenStrokes: 200,
+                        strokeColor: "#555",
+                        radicalColor: "#166E1A"
+                    });
+                ';
+            }
+
+            // Gộp tất cả lại thành một khối output hoàn chỉnh.
+            $final_output = '
+                <div class="hanzi-writer-auto-wrapper" style="margin-top:20px; padding-top:20px; border-top: 1px solid #eee;">
+                    <h4 style="text-align:center;">Thứ tự nét viết: ' . esc_html($title) . '</h4>
+                    <div style="display: flex; justify-content: center; align-items: flex-start; flex-wrap: wrap; gap: 20px;">
+                        ' . $all_hanzi_html . '
+                    </div>
+                </div>
+                <script>
+                    document.addEventListener("DOMContentLoaded", function() {
+                        if (typeof HanziWriter !== "undefined") {
+                            ' . $all_hanzi_script . '
+                        }
+                    });
+                </script>
+            ';
+            
+            // Nối khối mã đã tạo vào cuối nội dung.
+            $content .= $final_output;
+        }
+    }
+
+    return $content;
+}
+
+// Xóa các bộ lọc cũ đi để tránh chạy 2 lần (nếu bạn có đổi tên hàm hoặc sao chép code)
+remove_filter('the_content', 'auto_insert_stroke_order_into_glossary', 20);
+
+// Hook hàm mới, cuối cùng vào bộ lọc 'the_content' của WordPress
+add_filter('the_content', 'auto_insert_stroke_order_into_glossary_final', 20);
