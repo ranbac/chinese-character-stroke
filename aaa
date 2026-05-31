@@ -1,0 +1,366 @@
+<?php
+/**
+ * Tải thư viện Hanzi Writer JS thông qua hook của WordPress.
+ */
+function my_enqueue_hanzi_writer_script() {
+    wp_enqueue_script(
+        'hanzi-writer',
+        'https://cdn.jsdelivr.net/npm/hanzi-writer@3.5/dist/hanzi-writer.min.js',
+        array(),
+        '3.5',
+        true
+    );
+}
+add_action( 'wp_enqueue_scripts', 'my_enqueue_hanzi_writer_script' );
+
+
+/**
+ * Tự động chèn Hanzi Writer cho mục từ Glossary.
+ * Widget hợp nhất: Prev / Pause / Next + Luyện viết.
+ * Nét hiện tại động (animateStroke), nét cũ tĩnh (Low-Level SVG).
+ */
+function auto_insert_stroke_order_into_glossary_final( $content ) {
+
+    if ( ! is_singular( 'glossary' ) ) {
+        return $content;
+    }
+
+    $title = get_the_title();
+
+    if ( ! preg_match( '/^[\x{4e00}-\x{9fa5}]+$/u', $title ) ) {
+        return $content;
+    }
+
+    $post_id        = get_the_ID();
+    $characters     = mb_str_split( $title, 1, 'UTF-8' );
+    $all_hanzi_html = '';
+    $all_hanzi_js   = '';
+
+    $BOX = 200; // kích thước widget px
+
+    foreach ( $characters as $index => $char ) {
+        $static_svg  = 'hanzi-static-'  . $post_id . '-' . $index; // SVG nét cũ (lớp dưới)
+        $anim_div    = 'hanzi-anim-'    . $post_id . '-' . $index; // HanziWriter nét động (lớp trên)
+        $counter_id  = 'hanzi-counter-' . $post_id . '-' . $index; // "Nét X / Y"
+        $state_var   = 'hanziState_'    . $post_id . '_' . $index;
+        $anim_var    = 'hanziAnim_'     . $post_id . '_' . $index;
+        $quiz_var    = 'hanziQuiz_'     . $post_id . '_' . $index; // writer riêng cho quiz
+        $quiz_div    = 'hanzi-quiz-'    . $post_id . '-' . $index;
+        $char_json   = json_encode( $char );
+
+        // ── HTML ─────────────────────────────────────────────────────────────
+        $all_hanzi_html .= '
+        <div class="hanzi-char-wrapper"
+             style="flex-shrink:0; display:flex; flex-direction:column; align-items:center; gap:10px;">
+
+            <!--
+                Widget hợp nhất: 2 lớp chồng nhau
+                - Lớp dưới : SVG tĩnh (nét cũ)
+                - Lớp trên : HanziWriter animateStroke (nét hiện tại, động)
+                Khi quiz được bật, cả 2 lớp ẩn đi, lớp quiz hiện ra.
+            -->
+            <div style="position:relative; width:' . $BOX . 'px; height:' . $BOX . 'px;">
+
+                <!-- Lớp dưới: nét cũ tĩnh -->
+                <svg id="' . esc_attr($static_svg) . '"
+                     xmlns="http://www.w3.org/2000/svg"
+                     width="' . $BOX . '" height="' . $BOX . '"
+                     style="position:absolute; top:0; left:0;
+                            border:1px solid #e0e0e0; border-radius:6px; background:#fafafa;">
+                </svg>
+
+                <!-- Lớp trên: nét động (animateStroke) -->
+                <div id="' . esc_attr($anim_div) . '"
+                     style="position:absolute; top:0; left:0;
+                            width:' . $BOX . 'px; height:' . $BOX . 'px;">
+                </div>
+
+                <!-- Lớp quiz (ẩn mặc định) -->
+                <div id="' . esc_attr($quiz_div) . '"
+                     style="position:absolute; top:0; left:0;
+                            width:' . $BOX . 'px; height:' . $BOX . 'px; display:none;">
+                </div>
+
+            </div>
+
+            <!-- Nhãn "Nét X / Y" -->
+            <span id="' . esc_attr($counter_id) . '"
+                  style="font-size:12px; color:#777; min-height:1.2em;">Đang tải...</span>
+
+            <!-- Thanh điều khiển -->
+            <div style="display:flex; gap:6px; align-items:center;">
+                <button title="Nét trước"
+                        style="font-size:20px; padding:4px 10px; cursor:pointer;
+                               border:1px solid #ccc; border-radius:4px; background:#fff;"
+                        onclick="hanziStepNav(\'' . $state_var . '\', -1);">⏮</button>
+
+                <button title="Dừng / Tiếp tục"
+                        id="hanzi-pause-btn-' . $post_id . '-' . $index . '"
+                        style="font-size:20px; padding:4px 12px; cursor:pointer;
+                               border:1px solid #ccc; border-radius:4px; background:#fff;"
+                        onclick="hanziTogglePause(\'' . $state_var . '\', this);">⏸</button>
+
+                <button title="Nét tiếp theo"
+                        style="font-size:20px; padding:4px 10px; cursor:pointer;
+                               border:1px solid #ccc; border-radius:4px; background:#fff;"
+                        onclick="hanziStepNav(\'' . $state_var . '\', 1);">⏭</button>
+
+                <button title="Luyện viết"
+                        style="font-size:13px; padding:5px 10px; cursor:pointer;
+                               border:1px solid #aaa; border-radius:4px; background:#fff; margin-left:6px;"
+                        onclick="hanziStartQuiz(\'' . $state_var . '\', this);">✏️ Luyện viết</button>
+            </div>
+
+        </div>
+        ';
+
+        // ── JavaScript ────────────────────────────────────────────────────────
+        $all_hanzi_js .= '
+        (function() {
+            var char = ' . $char_json . ';
+            var BOX  = ' . (int)$BOX . ';
+
+            // ── animWriter: HanziWriter cho nét ĐỘNG ───────────────────────
+            var animWriter = HanziWriter.create(
+                ' . json_encode($anim_div) . ',
+                char,
+                {
+                    width: BOX, height: BOX, padding: 10,
+                    showCharacter: false,
+                    showOutline: false,
+                    strokeColor: "#1a6e1a",
+                    radicalColor: "#2e9e32",
+                    strokeAnimationSpeed: 1,
+                    delayBetweenStrokes: 0
+                }
+            );
+            window[' . json_encode($anim_var) . '] = animWriter;
+
+            // ── quizWriter: HanziWriter riêng cho quiz ─────────────────────
+            // Tạo sẵn nhưng ẩn, chỉ hiện khi bấm "Luyện viết"
+            var quizWriter = HanziWriter.create(
+                ' . json_encode($quiz_div) . ',
+                char,
+                {
+                    width: BOX, height: BOX, padding: 10,
+                    showCharacter: false,
+                    showOutline: true,
+                    showHintAfterMisses: 3,
+                    highlightOnComplete: true,
+                    strokeColor: "#555",
+                    radicalColor: "#166E1A"
+                }
+            );
+            window[' . json_encode($quiz_var) . '] = quizWriter;
+
+            // ── Low-Level: tải dữ liệu nét tĩnh ──────────────────────────
+            HanziWriter.loadCharacterData(char).then(function(charData) {
+
+                var tf      = HanziWriter.getScalingTransform(BOX, BOX, 10);
+                var svgEl   = document.getElementById(' . json_encode($static_svg) . ');
+                var counter = document.getElementById(' . json_encode($counter_id) . ');
+                var total   = charData.strokes.length;
+                if (!svgEl || !counter) return;
+
+                // ── State ──────────────────────────────────────────────────
+                var state = {
+                    current:    0,
+                    total:      total,
+                    paused:     false,
+                    autoTimer:  null,
+                    inQuiz:     false,
+                    charData:   charData,
+                    tf:         tf,
+                    svgEl:      svgEl,
+                    counter:    counter,
+                    animWriter: animWriter,
+                    quizWriter: quizWriter,
+                    animDiv:    document.getElementById(' . json_encode($anim_div) . '),
+                    staticSvg:  svgEl,
+                    quizDiv:    document.getElementById(' . json_encode($quiz_div) . '),
+                    pauseBtn:   document.getElementById("hanzi-pause-btn-' . $post_id . '-' . $index . '")
+                };
+                window[\'' . $state_var . '\'] = state;
+
+                // ── Vẽ nét cũ tĩnh (lớp dưới, nét 0..current-1) ──────────
+                state.renderStatic = function() {
+                    while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+                    if (state.current === 0) return;
+
+                    var g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+                    g.setAttribute("transform", state.tf.transform);
+
+                    for (var j = 0; j < state.current; j++) {
+                        var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                        p.setAttribute("d", charData.strokes[j]);
+                        var isRad = charData.radStrokes && charData.radStrokes.indexOf(j) !== -1;
+                        p.setAttribute("fill", isRad ? "#8db88d" : "#bbb");
+                        g.appendChild(p);
+                    }
+                    svgEl.appendChild(g);
+                };
+
+                // ── Animate nét hiện tại (lớp trên) ──────────────────────
+                state.animateCurrent = function(onDone) {
+                    animWriter.hideCharacter({ duration: 0 });
+                    animWriter.animateStroke(state.current, {
+                        onComplete: function() { if (onDone) onDone(); }
+                    });
+                    counter.textContent = "Nét " + (state.current + 1) + " / " + state.total;
+                };
+
+                // ── Render = tĩnh + động ──────────────────────────────────
+                state.render = function(onDone) {
+                    state.renderStatic();
+                    state.animateCurrent(onDone);
+                };
+
+                // ── Auto: chạy lần lượt từng nét, đợi xong rồi mới sang ──
+                state.startAuto = function() {
+                    state.paused = false;
+                    if (state.pauseBtn && state.pauseBtn.textContent !== "⏸") {
+                        state.pauseBtn.textContent = "⏸";
+                        state.pauseBtn.title = "Dừng";
+                    }
+                    state.render(function() {
+                        if (state.paused) return;
+                        if (state.current >= state.total - 1) {
+                            // Đến nét cuối: dừng, đổi nút thành ↺
+                            state.paused = true;
+                            if (state.pauseBtn) {
+                                state.pauseBtn.textContent = "↺";
+                                state.pauseBtn.title = "Xem lại từ đầu";
+                            }
+                            return;
+                        }
+                        state.autoTimer = setTimeout(function() {
+                            if (state.paused) return;
+                            state.current++;
+                            state.startAuto();
+                        }, 600);
+                    });
+                };
+
+                // ── Bắt đầu ───────────────────────────────────────────────
+                state.startAuto();
+
+            }).catch(function(err) {
+                console.warn("Hanzi viewer error:", char, err);
+            });
+
+        })();
+        ';
+    } // end foreach
+
+    // ── Hàm helper toàn cục ──────────────────────────────────────────────────
+    $shared_js = '
+    // Prev / Next — dừng auto, nhảy nét, animate 1 lần
+    function hanziStepNav(stateKey, dir) {
+        var s = window[stateKey];
+        if (!s || s.inQuiz) return;
+
+        s.paused = true;
+        if (s.autoTimer) { clearTimeout(s.autoTimer); s.autoTimer = null; }
+
+        var next = s.current + dir;
+        if (next < 0) next = 0;
+        if (next >= s.total) next = s.total - 1;
+        s.current = next;
+        s.render(); // animate 1 nét, không tự động tiếp
+    }
+
+    // Pause / Play toggle
+    function hanziTogglePause(stateKey, btn) {
+        var s = window[stateKey];
+        if (!s || s.inQuiz) return;
+
+        if (s.paused) {
+            // ↺ hoặc ▶ → phát lại
+            // Nếu đang ở nét cuối (↺) thì quay về đầu
+            if (s.current >= s.total - 1) {
+                s.current = 0;
+                s.animWriter.hideCharacter({ duration: 0 });
+            }
+            s.startAuto(); // startAuto tự đặt lại nút thành ⏸
+        } else {
+            s.paused = true;
+            if (s.autoTimer) { clearTimeout(s.autoTimer); s.autoTimer = null; }
+            btn.textContent = "▶";
+            btn.title = "Tiếp tục";
+        }
+    }
+
+    // Bắt đầu quiz: ẩn viewer, hiện quiz div
+    function hanziStartQuiz(stateKey, btn) {
+        var s = window[stateKey];
+        if (!s) return;
+
+        if (s.inQuiz) {
+            // Đang quiz → thoát quiz, quay về viewer
+            s.quizWriter.cancelQuiz();
+            s.quizDiv.style.display    = "none";
+            s.animDiv.style.display    = "";
+            s.staticSvg.style.display  = "";
+            s.inQuiz  = false;
+            s.paused  = false;
+            s.current = 0;
+            btn.textContent = "✏️ Luyện viết";
+            s.startAuto();
+        } else {
+            // Vào quiz
+            s.paused = true;
+            if (s.autoTimer) { clearTimeout(s.autoTimer); s.autoTimer = null; }
+            s.animDiv.style.display    = "none";
+            s.staticSvg.style.display  = "none";
+            s.quizDiv.style.display    = "";
+            s.inQuiz = true;
+            btn.textContent = "✖ Thoát quiz";
+            s.quizWriter.quiz({
+                onComplete: function(data) {
+                    // Quiz xong: tự thoát, quay về viewer
+                    setTimeout(function() {
+                        s.quizDiv.style.display    = "none";
+                        s.animDiv.style.display    = "";
+                        s.staticSvg.style.display  = "";
+                        s.inQuiz  = false;
+                        s.paused  = false;
+                        s.current = 0;
+                        btn.textContent = "✏️ Luyện viết";
+                        s.startAuto();
+                    }, 1000);
+                }
+            });
+        }
+    }
+    ';
+
+    // ── Output cuối cùng ─────────────────────────────────────────────────────
+    $final_output = '
+    <div class="hanzi-writer-auto-wrapper"
+         style="margin-top:20px; padding-top:20px; border-top:1px solid #eee;">
+        <h4 style="text-align:center;">Thứ tự nét viết: ' . esc_html( $title ) . '</h4>
+        <div style="display:flex; justify-content:center; align-items:flex-start; flex-wrap:wrap; gap:24px;">
+            ' . $all_hanzi_html . '
+        </div>
+    </div>
+
+    <script>
+    ' . $shared_js . '
+
+    document.addEventListener("DOMContentLoaded", function() {
+        if (typeof HanziWriter === "undefined") {
+            console.error("Hanzi Writer chưa được tải.");
+            return;
+        }
+        ' . $all_hanzi_js . '
+    });
+    </script>
+    ';
+
+    $content .= $final_output;
+    return $content;
+}
+
+remove_filter( 'the_content', 'auto_insert_stroke_order_into_glossary',       20 );
+remove_filter( 'the_content', 'auto_insert_stroke_order_into_glossary_final', 20 );
+add_filter(    'the_content', 'auto_insert_stroke_order_into_glossary_final', 20 );
